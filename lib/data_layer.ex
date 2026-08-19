@@ -278,6 +278,23 @@ defmodule AshMssql.DataLayer do
         doc: """
         Declares this resource as polymorphic. See the [polymorphic resources guide](/documentation/topics/resources/polymorphic-resources.md) for more.
         """
+      ],
+      returning_strategy: [
+        type: {:one_of, [:reload, :output, :output_into]},
+        default: :reload,
+        doc: """
+        How inserts/upserts fetch the written rows back (the `RETURNING` equivalent).
+
+        SQL Server forbids an inline `OUTPUT` clause on a table with enabled triggers (error 334), so the default avoids `OUTPUT` entirely:
+
+          * `:reload` (default) — write without `OUTPUT`, then re-select the rows by primary key (upsert: by the conflict keys). Works on tables with triggers and needs no per-table configuration. Requires client-supplied primary keys for `create`; when a `create` batch has server-generated (IDENTITY) keys it automatically falls back to `:output` for that batch.
+          * `:output` — inline `OUTPUT` via Ecto's `:returning`. Fastest and supports server-generated keys, but fails on tables with triggers.
+          * `:output_into` — capture `OUTPUT ... INTO` a temp table. Supports both triggers and server-generated keys, at the cost of an extra temp table per statement. Use this for trigger tables whose primary key is server-generated.
+
+        Correctness note: `:output`/`:output_into` return `INSERTED.*`, which is the row *as the INSERT/MERGE wrote it* — it does **not** reflect any changes an `AFTER`/`INSTEAD OF` trigger subsequently makes to the row. Only `:reload` re-reads the persisted row and therefore observes trigger-applied values. Prefer `:reload` when triggers mutate the written row and you need the final values.
+
+        Efficiency note: `:output` is a single statement with no extra round-trip (cheapest). `:reload` issues one extra `SELECT` (two round-trips), but the second query is a cheap key lookup. `:output_into` is a single round-trip but declares/populates a temp table for every statement, which is the heaviest per-statement overhead — reserve it for the trigger + server-generated-key case that `:reload` can't handle.
+        """
       ]
     ]
   }
@@ -853,13 +870,157 @@ defmodule AshMssql.DataLayer do
     repo.insert_all(source, entries, opts)
   end
 
-  defp insert_all_returning(source, entries, repo, _resource, action_select, opts) do
-    # MSSQL supports the OUTPUT clause (the RETURNING-equivalent), which Ecto's
-    # Tds adapter exposes via `:returning`. This gives Postgres-parity batch
-    # inserts that return the inserted rows directly — including server-generated
-    # identity/uuid keys — instead of a fragile SCOPE_IDENTITY()/reload round-trip
-    # (SCOPE_IDENTITY() is batch-scoped and would be NULL on a separate query).
+  defp insert_all_returning(source, entries, repo, resource, action_select, opts) do
+    case AshMssql.DataLayer.Info.returning_strategy(resource) do
+      :reload ->
+        # Default: avoid `OUTPUT` entirely (SQL Server forbids it on tables with
+        # triggers, error 334) by inserting without it and re-selecting the rows
+        # by primary key. Trigger-safe with no per-table configuration.
+        insert_all_reload(source, entries, repo, resource, action_select, opts)
+
+      :output_into ->
+        # SQL Server rejects an inline `OUTPUT` clause on a table with enabled
+        # triggers; capture the results with `OUTPUT ... INTO` instead. Ecto's Tds
+        # adapter only emits the inline form, so we build the insert by hand.
+        insert_all_returning_with_triggers(source, resource, entries, action_select, repo, opts)
+
+      :output ->
+        insert_all_returning_output(source, entries, repo, action_select, opts)
+    end
+  end
+
+  # MSSQL supports the OUTPUT clause (the RETURNING-equivalent), which Ecto's Tds
+  # adapter exposes via `:returning`. This returns the inserted rows directly —
+  # including server-generated identity/uuid keys — but SQL Server forbids the
+  # inline OUTPUT on tables with triggers (see `:reload`/`:output_into`).
+  #
+  # Efficiency: cheapest strategy — a single statement, no extra round-trip.
+  # Caveat: returns `INSERTED.*` as written by the INSERT, not any post-trigger
+  # values (see `:reload`).
+  defp insert_all_returning_output(source, entries, repo, action_select, opts) do
     repo.insert_all(source, entries, Keyword.put(opts, :returning, action_select || true))
+  end
+
+  # Insert without `OUTPUT`, then re-select the written rows by primary key. This
+  # sidesteps the trigger restriction on `OUTPUT` at the cost of one extra query
+  # (a cheap key lookup). Reload needs the primary key of every row up front, so a
+  # batch with server-generated (IDENTITY) keys falls back to inline `OUTPUT`.
+  # Unlike the `OUTPUT` strategies, the re-select observes the persisted row, so
+  # it reflects any values applied by AFTER triggers.
+  defp insert_all_reload(source, entries, repo, resource, action_select, opts) do
+    pkey = Ash.Resource.Info.primary_key(resource)
+
+    if pkey != [] and entries != [] and Enum.all?(entries, &full_pkey?(&1, pkey)) do
+      {count, _} = repo.insert_all(source, entries, opts)
+      records = reload_by_keys(source, resource, entries, pkey, action_select, repo, opts)
+      {count, records}
+    else
+      # No primary key, or server-generated keys we don't have up front: can't
+      # reload by key, so fall back to inline OUTPUT (which fails on trigger
+      # tables — use `:output_into` there).
+      insert_all_returning_output(source, entries, repo, action_select, opts)
+    end
+  end
+
+  defp full_pkey?(entry, pkey) do
+    Enum.all?(pkey, fn key -> not is_nil(Map.get(entry, key)) end)
+  end
+
+  # Re-select the rows identified by `keys` (a subset of the entry attributes: the
+  # primary key for inserts, the conflict keys for upserts). Built with Ecto so
+  # the key values are dumped through the schema's field types — verified to
+  # reload correctly for `uniqueidentifier`/`binary_id` keys, including via the
+  # `IN (...)` list (see `action_select_test`/`bulk_create_test`). Rows come back
+  # in arbitrary order; the caller reorders them by key.
+  defp reload_by_keys(source, _resource, entries, keys, action_select, repo, opts) do
+    reload_opts = Keyword.take(opts, [:prefix, :timeout])
+
+    from(row in source, as: ^0)
+    |> filter_by_keys(keys, entries)
+    |> apply_action_select(action_select)
+    |> repo.all(reload_opts)
+  end
+
+  # Single-column key: a single `IN` list. Composite key: an OR of per-row
+  # AND-equality groups, since Tds can't express a tuple `IN`. The dynamics are
+  # seeded from the first term (not a `true`/`false` literal): SQL Server has no
+  # boolean literal, so `WHERE 1 OR ...` is a type error (4145).
+  defp filter_by_keys(query, [key], entries) do
+    values = entries |> Enum.map(&Map.get(&1, key)) |> Enum.uniq()
+    Ecto.Query.where(query, [row], field(row, ^key) in ^values)
+  end
+
+  defp filter_by_keys(query, keys, entries) do
+    condition =
+      entries
+      |> Enum.uniq_by(fn entry -> Enum.map(keys, &Map.get(entry, &1)) end)
+      |> Enum.map(&row_match(keys, &1))
+      |> Enum.reduce(fn row_match, acc -> Ecto.Query.dynamic(^acc or ^row_match) end)
+
+    Ecto.Query.where(query, ^condition)
+  end
+
+  # A single row's composite-key match: `k1 = v1 AND k2 = v2 AND ...`.
+  defp row_match(keys, entry) do
+    keys
+    |> Enum.map(fn key ->
+      value = Map.get(entry, key)
+      Ecto.Query.dynamic([row], field(row, ^key) == ^value)
+    end)
+    |> Enum.reduce(fn condition, acc -> Ecto.Query.dynamic(^acc and ^condition) end)
+  end
+
+  # Insert into a table with enabled triggers. SQL Server forbids the inline
+  # `OUTPUT` clause there, so we redirect the returned rows into a temp table via
+  # `OUTPUT ... INTO`, then read them back. The temp table is created with
+  # `SELECT ... INTO ... UNION ALL SELECT ...` so it inherits the target's exact
+  # column types while shedding IDENTITY (which a plain `SELECT INTO` would copy,
+  # breaking the `OUTPUT INTO` insert). Both the temp table and `SET NOCOUNT ON`
+  # are scoped to this single `sp_executesql` batch, so the only result set
+  # returned is the trailing `SELECT`.
+  #
+  # Caveat: `OUTPUT INSERTED.*` captures the row as this INSERT wrote it, *before*
+  # any AFTER trigger runs — so values a trigger changes afterward are NOT
+  # reflected here. Use `:reload` when you need the post-trigger row state.
+  #
+  # Efficiency: one round-trip, but the per-statement temp table makes this the
+  # heaviest strategy; it exists for the trigger + server-generated-key case that
+  # `:reload` can't serve.
+  defp insert_all_returning_with_triggers(source, resource, entries, action_select, repo, opts) do
+    table = upsert_table(source, resource)
+    prefix = opts[:prefix]
+    qualified_table = if prefix, do: "[#{prefix}].[#{table}]", else: "[#{table}]"
+
+    columns =
+      entries
+      |> Enum.flat_map(&Map.keys/1)
+      |> Enum.uniq()
+
+    output_columns = returning_output_columns(resource, action_select)
+    output_col_list = Enum.map_join(output_columns, ", ", &"[#{&1}]")
+
+    insert_col_list =
+      Enum.map_join(columns, ", ", &"[#{resource.__schema__(:field_source, &1)}]")
+
+    output_clause = Enum.map_join(output_columns, ", ", &"INSERTED.[#{&1}]")
+
+    {values_sql, params} = upsert_values(entries, columns, resource, repo)
+
+    sql = """
+    SET NOCOUNT ON;
+    SELECT #{output_col_list} INTO #ash_returning FROM #{qualified_table} WHERE 1 = 0
+    UNION ALL SELECT #{output_col_list} FROM #{qualified_table} WHERE 1 = 0;
+    INSERT INTO #{qualified_table} (#{insert_col_list})
+    OUTPUT #{output_clause} INTO #ash_returning (#{output_col_list})
+    VALUES #{values_sql};
+    SELECT #{output_col_list} FROM #ash_returning;
+    """
+
+    %{columns: result_columns, rows: rows, num_rows: num_rows} = repo.query!(sql, params)
+
+    records = Enum.map(rows, fn row -> repo.load(resource, {result_columns, row}) end)
+
+    {num_rows, records}
   end
 
   # Ecto's Tds adapter only supports `on_conflict: :raise`, so upsert cannot go
@@ -887,19 +1048,7 @@ defmodule AshMssql.DataLayer do
       |> Enum.filter(&(&1 in columns))
       |> Enum.reject(&(&1 in keys))
 
-    # OUTPUT what the action selects (parity with RETURNING); the full row when
-    # there is no action_select. Filtering the schema's field list (rather than
-    # mapping action_select directly) keeps unknown names out of the SQL.
-    output_fields =
-      case action_select do
-        nil -> resource.__schema__(:fields)
-        fields -> Enum.filter(resource.__schema__(:fields), &(&1 in fields))
-      end
-
-    output_columns =
-      output_fields
-      |> Enum.map(&resource.__schema__(:field_source, &1))
-      |> Enum.uniq()
+    output_columns = returning_output_columns(resource, action_select)
 
     {values_sql, params} = upsert_values(entries, columns, resource, repo)
 
@@ -919,26 +1068,74 @@ defmodule AshMssql.DataLayer do
             Enum.map_join(fields, ", ", &"target.[#{&1}] = source.[#{&1}]")
       end
 
-    output_clause = Enum.map_join(output_columns, ", ", &"INSERTED.[#{&1}]")
-
-    sql = """
+    merge = """
     MERGE INTO #{qualified_table} WITH (HOLDLOCK) AS target
     USING (VALUES #{values_sql}) AS source (#{col_list})
     ON (#{on_clause})
     #{matched_clause}
     WHEN NOT MATCHED BY TARGET THEN INSERT (#{col_list}) VALUES (#{Enum.map_join(columns, ", ", &"source.[#{&1}]")})
-    OUTPUT #{output_clause};
     """
 
-    %{columns: result_columns, rows: rows, num_rows: num_rows} = repo.query!(sql, params)
+    case AshMssql.DataLayer.Info.returning_strategy(resource) do
+      :reload ->
+        # Default: run the MERGE without `OUTPUT` (trigger-safe), then re-select
+        # the affected rows by their conflict keys, which are always present in
+        # the incoming values.
+        %{num_rows: num_rows} = repo.query!("#{merge};", params)
+        records = reload_by_keys(source, resource, entries, keys, action_select, repo, opts)
+        {num_rows, records}
 
-    records = Enum.map(rows, fn row -> repo.load(resource, {result_columns, row}) end)
+      strategy ->
+        output_clause = Enum.map_join(output_columns, ", ", &"INSERTED.[#{&1}]")
 
-    {num_rows, records}
+        sql =
+          case strategy do
+            :output_into ->
+              # SQL Server forbids an inline `OUTPUT` on a table with triggers, so
+              # capture the merged rows into a temp table via `OUTPUT ... INTO` and
+              # read them back. See `insert_all_returning_with_triggers/6` — same
+              # per-statement temp-table cost, and same caveat that `INSERTED.*`
+              # does not reflect post-trigger changes to the row.
+              output_col_list = Enum.map_join(output_columns, ", ", &"[#{&1}]")
+
+              """
+              SET NOCOUNT ON;
+              SELECT #{output_col_list} INTO #ash_returning FROM #{qualified_table} WHERE 1 = 0
+              UNION ALL SELECT #{output_col_list} FROM #{qualified_table} WHERE 1 = 0;
+              #{merge}OUTPUT #{output_clause} INTO #ash_returning (#{output_col_list});
+              SELECT #{output_col_list} FROM #ash_returning;
+              """
+
+            :output ->
+              "#{merge}OUTPUT #{output_clause};\n"
+          end
+
+        %{columns: result_columns, rows: rows, num_rows: num_rows} = repo.query!(sql, params)
+
+        records = Enum.map(rows, fn row -> repo.load(resource, {result_columns, row}) end)
+
+        {num_rows, records}
+    end
   end
 
   defp upsert_table({table, _resource}, _fallback), do: table
   defp upsert_table(_source, resource), do: AshMssql.DataLayer.Info.table(resource)
+
+  # The DB column names to return via OUTPUT, giving RETURNING parity: what the
+  # action selects when present, else the full row. Filtering the schema's field
+  # list (rather than mapping action_select directly) keeps unknown names out of
+  # the SQL.
+  defp returning_output_columns(resource, action_select) do
+    output_fields =
+      case action_select do
+        nil -> resource.__schema__(:fields)
+        fields -> Enum.filter(resource.__schema__(:fields), &(&1 in fields))
+      end
+
+    output_fields
+    |> Enum.map(&resource.__schema__(:field_source, &1))
+    |> Enum.uniq()
+  end
 
   # `nil` action_select means the caller didn't restrict the selection (or the
   # capability isn't in play) and the full row is returned. Otherwise the

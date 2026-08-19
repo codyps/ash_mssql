@@ -36,29 +36,12 @@ defmodule AshMssql.ActionSelectTest do
     end
   end
 
-  # Inserts return records via `OUTPUT INSERTED.[...]` on the INSERT itself, so
-  # the assertions target that clause — the INSERT's column list legitimately
-  # contains every written attribute.
-  defp insert_output_clause(queries) do
-    queries
-    |> Enum.find(fn query ->
-      String.starts_with?(query, "INSERT") and String.contains?(query, "posts")
-    end)
-    |> case do
-      nil ->
-        flunk("expected an INSERT against posts, got: #{inspect(queries)}")
-
-      query ->
-        assert [_, output] = String.split(query, "OUTPUT "),
-               "expected an OUTPUT clause in: #{query}"
-
-        output |> String.split("VALUES") |> hd()
-    end
-  end
-
-  # Only the SELECT list — assertions on columns must not accidentally match
-  # the WHERE clause (`WHERE s0.[id] = ...`).
-  defp update_reload_select_clause(queries) do
+  # With the default `:reload` returning strategy, inserts/updates/upserts do not
+  # use an inline `OUTPUT` clause (SQL Server forbids it on tables with
+  # triggers). The written rows are re-selected afterwards, so column-trimming
+  # assertions target that reload `SELECT` list. Only the SELECT list — columns
+  # must not accidentally match the WHERE clause (`WHERE s0.[id] = ...`).
+  defp reload_select_clause(queries) do
     queries
     |> Enum.find(fn query ->
       String.starts_with?(query, "SELECT") and String.contains?(query, "posts")
@@ -84,12 +67,12 @@ defmodule AshMssql.ActionSelectTest do
     assert [%{title: "fred"}, %{title: "george"}] =
              Enum.sort_by(result.records, & &1.title)
 
-    output = insert_output_clause(queries)
+    select_clause = reload_select_clause(queries)
 
-    assert output =~ "INSERTED.[id]"
-    assert output =~ "INSERTED.[title]"
-    refute output =~ "INSERTED.[score]"
-    refute output =~ "INSERTED.[stuff]"
+    assert select_clause =~ "[id]"
+    assert select_clause =~ "[title]"
+    refute select_clause =~ "[score]"
+    refute select_clause =~ "[stuff]"
   end
 
   test "bulk create without a select returns the default-selected fields as full records" do
@@ -102,15 +85,9 @@ defmodule AshMssql.ActionSelectTest do
 
     assert [%{title: "fred", score: 3}] = result.records
 
-    # No explicit select means all default-selected attributes come back on the
-    # OUTPUT clause, so ash core has no reason to issue a follow-up SELECT.
-    output = insert_output_clause(queries)
-    assert output =~ "INSERTED.[score]"
-
-    refute Enum.any?(
-             queries,
-             &(String.starts_with?(&1, "SELECT") and String.contains?(&1, "posts"))
-           )
+    # No explicit select means all default-selected attributes are reloaded.
+    select_clause = reload_select_clause(queries)
+    assert select_clause =~ "[score]"
   end
 
   test "creates with database-generated integer primary keys still return real values" do
@@ -134,10 +111,10 @@ defmodule AshMssql.ActionSelectTest do
 
     assert %{title: "fred", score: %Ash.NotLoaded{}} = post
 
-    output = insert_output_clause(queries)
+    select_clause = reload_select_clause(queries)
 
-    assert output =~ "INSERTED.[title]"
-    refute output =~ "INSERTED.[score]"
+    assert select_clause =~ "[title]"
+    refute select_clause =~ "[score]"
   end
 
   test "non-default-selected attributes are not returned, but always_select? ones are" do
@@ -161,12 +138,12 @@ defmodule AshMssql.ActionSelectTest do
     # though it isn't selected by default.
     assert post.uniq_custom_two == "always selected"
 
-    output = insert_output_clause(queries)
-    refute output =~ "INSERTED.[uniq_custom_one]"
-    assert output =~ "INSERTED.[uniq_custom_two]"
+    select_clause = reload_select_clause(queries)
+    refute select_clause =~ "[uniq_custom_one]"
+    assert select_clause =~ "[uniq_custom_two]"
   end
 
-  test "upserts trim the MERGE OUTPUT to the action select plus the upsert keys" do
+  test "upserts trim the reload SELECT to the action select plus the upsert keys" do
     {post, queries} =
       capture_queries(fn ->
         Post
@@ -185,16 +162,16 @@ defmodule AshMssql.ActionSelectTest do
     merge = Enum.find(queries, &String.starts_with?(&1, "MERGE"))
     assert merge, "expected a MERGE against posts, got: #{inspect(queries)}"
 
-    assert [_, output] = String.split(merge, "OUTPUT ")
+    select_clause = reload_select_clause(queries)
 
-    assert output =~ "INSERTED.[id]"
-    assert output =~ "INSERTED.[title]"
+    assert select_clause =~ "[id]"
+    assert select_clause =~ "[title]"
     # The upsert keys stay selected so results can be correlated back to their
     # changesets.
-    assert output =~ "INSERTED.[uniq_one]"
-    assert output =~ "INSERTED.[uniq_two]"
-    refute output =~ "INSERTED.[score]"
-    refute output =~ "INSERTED.[stuff]"
+    assert select_clause =~ "[uniq_one]"
+    assert select_clause =~ "[uniq_two]"
+    refute select_clause =~ "[score]"
+    refute select_clause =~ "[stuff]"
   end
 
   test "updates reload fields the changeset data doesn't carry" do
@@ -240,7 +217,7 @@ defmodule AshMssql.ActionSelectTest do
     assert %Ash.NotLoaded{} = updated.score
     assert updated.title == "fred"
 
-    select_clause = update_reload_select_clause(queries)
+    select_clause = reload_select_clause(queries)
 
     assert select_clause =~ "[title]"
     refute select_clause =~ "[stuff]"

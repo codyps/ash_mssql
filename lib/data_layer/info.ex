@@ -83,6 +83,11 @@ defmodule AshMssql.DataLayer.Info do
     Extension.get_opt(resource, [:mssql], :polymorphic?, nil, true)
   end
 
+  @doc "How inserts/upserts fetch written rows back: `:reload`, `:output`, or `:output_into`"
+  def returning_strategy(resource) do
+    Extension.get_opt(resource, [:mssql], :returning_strategy, :reload, true)
+  end
+
   @doc "The configured unique_index_names"
   def unique_index_names(resource) do
     Extension.get_opt(resource, [:mssql], :unique_index_names, [], true)

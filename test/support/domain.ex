@@ -4,6 +4,7 @@ defmodule AshMssql.Test.Domain do
 
   resources do
     resource(AshMssql.Test.Post)
+    resource(AshMssql.Test.PostOutputInto)
     resource(AshMssql.Test.Comment)
     resource(AshMssql.Test.IntegerPost)
     resource(AshMssql.Test.Rating)
