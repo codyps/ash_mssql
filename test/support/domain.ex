@@ -18,6 +18,8 @@ defmodule AshMssql.Test.Domain do
     resource(AshMssql.Test.ReplicaPost)
     resource(AshMssql.Test.LegacyItem)
     resource(AshMssql.Test.PhantomItem)
+    resource(AshMssql.Test.MissingTableItem)
+    resource(AshMssql.Test.LaxItem)
   end
 
   authorization do

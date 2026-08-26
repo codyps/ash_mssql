@@ -1157,12 +1157,13 @@ defmodule AshMssql.DataLayer do
     )
   end
 
-  # MSSQL error 547: a statement conflicted with a FOREIGN KEY / REFERENCE
-  # (or CHECK) constraint — e.g. inserting a row that references a missing parent.
+  # Destroys go through `repo.delete` (unlike the raw insert/update paths),
+  # so a REFERENCE-constraint violation surfaces as an Ecto.ConstraintError
+  # when the deleted resource has no back-relation to the referencing
+  # resource (`add_related_foreign_key_constraints` can only declare
+  # constraints it can see).
   defp handle_raised_error(
-         %Tds.Error{
-           mssql: %{number: 547}
-         },
+         %Ecto.ConstraintError{type: :foreign_key},
          stacktrace,
          context,
          resource
@@ -1170,12 +1171,72 @@ defmodule AshMssql.DataLayer do
     handle_raised_error(
       Ash.Error.Changes.InvalidChanges.exception(
         fields: Ash.Resource.Info.primary_key(resource),
-        message: "referenced something that does not exist"
+        message: "would leave records behind"
       ),
       stacktrace,
       context,
       resource
     )
+  end
+
+  # MSSQL error 547: a statement conflicted with a constraint. The message
+  # distinguishes three kinds:
+  #   FOREIGN KEY - this row references a parent that does not exist
+  #   REFERENCE   - other rows still reference this row (e.g. deleting a
+  #                 parent that has children)
+  #   CHECK       - a CHECK constraint rejected the values
+  defp handle_raised_error(
+         %Tds.Error{
+           mssql: mssql
+         },
+         stacktrace,
+         context,
+         resource
+       )
+       when is_map(mssql) and mssql.number == 547 do
+    raw_message = mssql[:msg_text] || ""
+
+    error =
+      case Regex.run(
+             ~r/conflicted with the (CHECK|FOREIGN KEY|REFERENCE) constraint "([^"]+)"/,
+             raw_message,
+             capture: :all_but_first
+           ) do
+        ["CHECK", constraint_name] ->
+          Ash.Error.Changes.InvalidChanges.exception(
+            fields: [],
+            message: "violates check constraint #{inspect(constraint_name)}"
+          )
+
+        ["FOREIGN KEY", constraint_name] ->
+          case find_foreign_key_field(resource, context, constraint_name) do
+            %{field: field, message: message} ->
+              Ash.Error.Changes.InvalidAttribute.exception(
+                field: field,
+                message: message || "does not exist"
+              )
+
+            nil ->
+              Ash.Error.Changes.InvalidChanges.exception(
+                fields: Ash.Resource.Info.primary_key(resource),
+                message: "referenced something that does not exist"
+              )
+          end
+
+        ["REFERENCE", _constraint_name] ->
+          Ash.Error.Changes.InvalidChanges.exception(
+            fields: Ash.Resource.Info.primary_key(resource),
+            message: "would leave records behind"
+          )
+
+        _ ->
+          Ash.Error.Changes.InvalidChanges.exception(
+            fields: Ash.Resource.Info.primary_key(resource),
+            message: "referenced something that does not exist"
+          )
+      end
+
+    handle_raised_error(error, stacktrace, context, resource)
   end
 
   # MSSQL error 207: a statement referenced a column that does not exist.
@@ -1205,6 +1266,143 @@ defmodule AshMssql.DataLayer do
         table: AshMssql.DataLayer.Info.table(resource),
         column: column,
         raw_message: raw_message
+      ),
+      stacktrace,
+      context,
+      resource
+    )
+  end
+
+  # MSSQL error 208: a statement referenced a table that does not exist -
+  # usually a resource whose migrations were never generated or run.
+  defp handle_raised_error(
+         %Tds.Error{
+           mssql: mssql
+         },
+         stacktrace,
+         context,
+         resource
+       )
+       when is_map(mssql) and mssql.number == 208 do
+    raw_message = mssql[:msg_text] || ""
+
+    table =
+      case Regex.run(~r/Invalid object name '([^']+)'/, raw_message, capture: :all_but_first) do
+        [table] -> table
+        _ -> AshMssql.DataLayer.Info.table(resource)
+      end
+
+    handle_raised_error(
+      AshMssql.Error.MissingTable.exception(
+        resource: resource,
+        table: table,
+        raw_message: raw_message
+      ),
+      stacktrace,
+      context,
+      resource
+    )
+  end
+
+  # MSSQL error 515: NULL written to a non-nullable column. Ash validates
+  # allow_nil? itself, so reaching the database with a NULL usually means the
+  # resource declares the attribute as nullable while the column is NOT NULL.
+  defp handle_raised_error(
+         %Tds.Error{
+           mssql: mssql
+         },
+         stacktrace,
+         context,
+         resource
+       )
+       when is_map(mssql) and mssql.number == 515 do
+    raw_message = mssql[:msg_text] || ""
+
+    error =
+      with [column] <-
+             Regex.run(~r/Cannot insert the value NULL into column '([^']+)'/, raw_message,
+               capture: :all_but_first
+             ),
+           %{name: field} <- find_attribute_by_source(resource, column) do
+        Ash.Error.Changes.InvalidAttribute.exception(
+          field: field,
+          message: "must not be null"
+        )
+      else
+        _ ->
+          Ash.Error.Changes.InvalidChanges.exception(
+            fields: [],
+            message: "a column that does not allow null values was set to null: #{raw_message}"
+          )
+      end
+
+    handle_raised_error(error, stacktrace, context, resource)
+  end
+
+  # MSSQL errors 2628 (and its legacy form 8152): a string value is too long
+  # for its column. 2628 names the table, column, and truncated value; 8152
+  # carries no details.
+  defp handle_raised_error(
+         %Tds.Error{
+           mssql: mssql
+         },
+         stacktrace,
+         context,
+         resource
+       )
+       when is_map(mssql) and (mssql.number == 2628 or mssql.number == 8152) do
+    raw_message = mssql[:msg_text] || ""
+
+    error =
+      with [_table, column] <-
+             Regex.run(
+               ~r/String or binary data would be truncated in table '([^']+)', column '([^']+)'/,
+               raw_message,
+               capture: :all_but_first
+             ),
+           %{name: field} <- find_attribute_by_source(resource, column) do
+        Ash.Error.Changes.InvalidAttribute.exception(
+          field: field,
+          message: "value is too long for the column and would be truncated"
+        )
+      else
+        _ ->
+          Ash.Error.Changes.InvalidChanges.exception(
+            fields: [],
+            message: "a value is too long for its column and would be truncated"
+          )
+      end
+
+    handle_raised_error(error, stacktrace, context, resource)
+  end
+
+  # MSSQL error 8115: arithmetic overflow - a numeric value does not fit the
+  # column's precision/scale. The message names only the types involved.
+  defp handle_raised_error(
+         %Tds.Error{
+           mssql: mssql
+         },
+         stacktrace,
+         context,
+         resource
+       )
+       when is_map(mssql) and mssql.number == 8115 do
+    raw_message = mssql[:msg_text] || ""
+
+    detail =
+      case Regex.run(
+             ~r/Arithmetic overflow error converting (.+) to data type (.+)\./,
+             raw_message,
+             capture: :all_but_first
+           ) do
+        [from, to] -> " converting #{from} to #{to}"
+        _ -> ""
+      end
+
+    handle_raised_error(
+      Ash.Error.Changes.InvalidChanges.exception(
+        fields: [],
+        message: "value is out of range (arithmetic overflow#{detail})"
       ),
       stacktrace,
       context,
@@ -1313,6 +1511,61 @@ defmodule AshMssql.DataLayer do
         if to_string(name) == searched_name do
           %{fields: List.wrap(keys), message: message}
         end
+    end)
+  end
+
+  # Find the attribute whose database column matches `column` (attributes can
+  # be renamed with `source`).
+  defp find_attribute_by_source(resource, column) do
+    resource
+    |> Ash.Resource.Info.attributes()
+    |> Enum.find(fn attribute ->
+      to_string(Map.get(attribute, :source) || attribute.name) == column
+    end)
+  end
+
+  # Map a FOREIGN KEY constraint name back to the attribute that references
+  # the missing parent: explicitly configured `foreign_key_names` win, then
+  # the `references` DSL (falling back to the generator's default
+  # `<table>_<source_attribute>_fkey` naming).
+  defp find_foreign_key_field(resource, context, constraint_name) do
+    find_configured_foreign_key(resource, context, constraint_name) ||
+      find_reference_foreign_key(resource, constraint_name)
+  end
+
+  defp find_configured_foreign_key(resource, context, constraint_name) do
+    resource
+    |> AshMssql.DataLayer.Info.foreign_key_names()
+    |> resolve_configured_names(context)
+    |> Enum.find_value(fn
+      {key, name} ->
+        if to_string(name) == constraint_name do
+          %{field: key, message: nil}
+        end
+
+      {key, name, message} ->
+        if to_string(name) == constraint_name do
+          %{field: key, message: message}
+        end
+    end)
+  end
+
+  defp find_reference_foreign_key(resource, constraint_name) do
+    table = AshMssql.DataLayer.Info.table(resource)
+    references = AshMssql.DataLayer.Info.references(resource)
+
+    resource
+    |> Ash.Resource.Info.relationships()
+    |> Enum.filter(&(&1.type == :belongs_to))
+    |> Enum.find_value(fn relationship ->
+      name =
+        Enum.find_value(references, fn reference ->
+          if reference.relationship == relationship.name, do: reference.name
+        end) || "#{table}_#{relationship.source_attribute}_fkey"
+
+      if to_string(name) == constraint_name do
+        %{field: relationship.source_attribute, message: nil}
+      end
     end)
   end
 
