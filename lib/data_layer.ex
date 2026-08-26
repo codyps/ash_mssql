@@ -1185,7 +1185,7 @@ defmodule AshMssql.DataLayer do
            mssql: mssql
          },
          _stacktrace,
-         _context,
+         context,
          resource
        )
        when is_map(mssql) and (mssql.number == 2627 or mssql.number == 2601) do
@@ -1194,7 +1194,7 @@ defmodule AshMssql.DataLayer do
     index_name = extract_duplicate_key_name(message_text)
 
     %{fields: fields, message: message} =
-      find_constraint_data(resource, index_name)
+      find_constraint_data(resource, context, index_name)
 
     message = message || "has already been taken"
 
@@ -1233,15 +1233,16 @@ defmodule AshMssql.DataLayer do
     end
   end
 
-  defp find_constraint_data(resource, :PRIMARY) do
+  defp find_constraint_data(resource, _context, :PRIMARY) do
     %{
       fields: Ash.Resource.Info.primary_key(resource),
       message: nil
     }
   end
 
-  defp find_constraint_data(resource, index_name) do
+  defp find_constraint_data(resource, context, index_name) do
     find_custom_index(resource, index_name) || find_identity(resource, index_name) ||
+      find_unique_index_name(resource, context, index_name) ||
       %{fields: Ash.Resource.Info.primary_key(resource), message: nil}
   end
 
@@ -1252,9 +1253,44 @@ defmodule AshMssql.DataLayer do
     |> AshMssql.DataLayer.Info.custom_indexes()
     |> Enum.find(fn custom_index ->
       name = AshMssql.CustomIndex.name(table, custom_index)
-      name == searched_name
+      to_string(name) == to_string(searched_name)
     end)
   end
+
+  # Covers constraints declared via `unique_index_names` - typically UNIQUE KEY
+  # constraints created outside of Ash-generated migrations, whose names don't
+  # follow the `<table>_<identity>_index` convention.
+  defp find_unique_index_name(resource, context, searched_name) do
+    searched_name = to_string(searched_name)
+
+    resource
+    |> AshMssql.DataLayer.Info.unique_index_names()
+    |> resolve_configured_names(context)
+    |> Enum.find_value(fn
+      {keys, name} ->
+        if to_string(name) == searched_name do
+          %{fields: List.wrap(keys), message: nil}
+        end
+
+      {keys, name, message} ->
+        if to_string(name) == searched_name do
+          %{fields: List.wrap(keys), message: message}
+        end
+    end)
+  end
+
+  defp resolve_configured_names({m, f, a}, %Ecto.Changeset{} = changeset) do
+    List.wrap(apply(m, f, [changeset | a]))
+  end
+
+  defp resolve_configured_names({m, f, a}, {:bulk_create, %Ecto.Changeset{} = changeset}) do
+    List.wrap(apply(m, f, [changeset | a]))
+  end
+
+  # An MFA needs a changeset to resolve; other contexts (e.g. queries) can't
+  # provide one, so configured names are unavailable there.
+  defp resolve_configured_names({_m, _f, _a}, _context), do: []
+  defp resolve_configured_names(value, _context), do: List.wrap(value)
 
   defp find_identity(resource, searched_index_name) do
     table = AshMssql.DataLayer.Info.table(resource)
