@@ -129,6 +129,7 @@ defmodule AshMssql.MixProject do
       {:ecto, "~> 3.12"},
       {:jason, "~> 1.0"},
       {:ash, ash_version("~> 3.19")},
+      {:splode, "~> 0.3"},
       {:picosat_elixir, "~> 0.2"},
       {:ash_sql, ash_sql_version(">= 0.6.0 and < 0.7.0")},
       {:igniter, "~> 0.5", only: [:dev, :test]},

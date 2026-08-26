@@ -17,6 +17,7 @@ defmodule AshMssql.Test.Domain do
     resource(AshMssql.Test.Manager)
     resource(AshMssql.Test.ReplicaPost)
     resource(AshMssql.Test.LegacyItem)
+    resource(AshMssql.Test.PhantomItem)
   end
 
   authorization do

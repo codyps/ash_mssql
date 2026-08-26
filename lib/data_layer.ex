@@ -574,6 +574,9 @@ defmodule AshMssql.DataLayer do
       end
 
     {:ok, add_exists_aggs(result, resource, query_before_select, exists)}
+  rescue
+    e ->
+      handle_raised_error(e, __STACKTRACE__, query, resource)
   end
 
   defp add_exists_aggs(result, resource, query, exists) do
@@ -1168,6 +1171,40 @@ defmodule AshMssql.DataLayer do
       Ash.Error.Changes.InvalidChanges.exception(
         fields: Ash.Resource.Info.primary_key(resource),
         message: "referenced something that does not exist"
+      ),
+      stacktrace,
+      context,
+      resource
+    )
+  end
+
+  # MSSQL error 207: a statement referenced a column that does not exist.
+  # Reads, filters, sorts, inserts, upserts, and updates all raise this same
+  # error number when the resource defines an attribute whose column is
+  # missing from the table - usually schema drift from unrun migrations.
+  defp handle_raised_error(
+         %Tds.Error{
+           mssql: mssql
+         },
+         stacktrace,
+         context,
+         resource
+       )
+       when is_map(mssql) and mssql.number == 207 do
+    raw_message = mssql[:msg_text] || ""
+
+    column =
+      case Regex.run(~r/Invalid column name '([^']+)'/, raw_message, capture: :all_but_first) do
+        [column] -> column
+        _ -> nil
+      end
+
+    handle_raised_error(
+      AshMssql.Error.MissingColumn.exception(
+        resource: resource,
+        table: AshMssql.DataLayer.Info.table(resource),
+        column: column,
+        raw_message: raw_message
       ),
       stacktrace,
       context,
